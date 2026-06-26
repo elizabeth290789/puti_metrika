@@ -17,7 +17,9 @@ except ImportError:  # pragma: no cover
     st = None
 
 
-API_BASE = "https://api-metrika.yandex.net/management/v1/counter/{counter_id}/logrequests"
+API_HOST = "https://api-metrika.yandex.net"
+LOGREQUESTS_ENDPOINT = API_HOST + "/management/v1/counter/{counter_id}/logrequests"
+LOGREQUEST_ENDPOINT = API_HOST + "/management/v1/counter/{counter_id}/logrequest/{request_id}"
 
 
 class MetrikaAPIError(Exception):
@@ -55,7 +57,15 @@ class MetrikaLogsClient:
         if not self.token or self.session is None:
             raise MetrikaAPIError("YANDEX_METRIKA_TOKEN не задан. Добавьте токен в Streamlit Secrets или переменную окружения.")
 
-    def _handle_response(self, response: requests.Response, context: str) -> dict | str:
+    @staticmethod
+    def _create_request_url(counter_id: str | int) -> str:
+        return LOGREQUESTS_ENDPOINT.format(counter_id=counter_id)
+
+    @staticmethod
+    def _request_url(counter_id: str | int, request_id: int) -> str:
+        return LOGREQUEST_ENDPOINT.format(counter_id=counter_id, request_id=request_id)
+
+    def _handle_response(self, response: requests.Response, context: str, endpoint: str) -> dict | str:
         if response.ok:
             content_type = response.headers.get("content-type", "")
             return response.json() if "json" in content_type else response.text
@@ -65,22 +75,22 @@ class MetrikaLogsClient:
             message = payload.get("message") or payload.get("errors", [{}])[0].get("message", "")
         except Exception:
             message = response.text[:500]
-        raise MetrikaAPIError(f"Ошибка Logs API ({context}): HTTP {response.status_code}. {message}")
+        raise MetrikaAPIError(f"Ошибка Logs API ({context}): HTTP {response.status_code}. Endpoint: {endpoint}. {message}")
 
     def _create_request(self, counter_id: str | int, source: str, fields: list[str], date_from, date_to, filters: str) -> int:
         self._require_token()
         params = {"date1": str(date_from), "date2": str(date_to), "source": source, "fields": ",".join(fields), "filters": filters}
-        url = API_BASE.format(counter_id=counter_id)
+        url = self._create_request_url(counter_id)
         response = self.session.post(url, params=params, timeout=60)
-        data = self._handle_response(response, "создание запроса")
+        data = self._handle_response(response, "создание запроса", url)
         return int(data["log_request"]["request_id"])
 
     def _wait_processed(self, counter_id: str | int, request_id: int) -> list[dict]:
         deadline = time.time() + self.timeout_seconds
-        url = f"{API_BASE.format(counter_id=counter_id)}/{request_id}"
+        url = self._request_url(counter_id, request_id)
         while time.time() < deadline:
             response = self.session.get(url, timeout=60)
-            data = self._handle_response(response, "проверка статуса")
+            data = self._handle_response(response, "проверка статуса", url)
             request = data.get("log_request", {})
             status = request.get("status")
             if status == "processed":
@@ -95,16 +105,16 @@ class MetrikaLogsClient:
         frames = []
         for part in parts:
             part_number = part.get("part_number")
-            url = f"{API_BASE.format(counter_id=counter_id)}/{request_id}/part/{part_number}/download"
+            url = f"{self._request_url(counter_id, request_id)}/part/{part_number}/download"
             response = self.session.get(url, timeout=120)
-            text = self._handle_response(response, "скачивание данных")
+            text = self._handle_response(response, "скачивание данных", url)
             if str(text).strip():
                 frames.append(pd.read_csv(io.StringIO(str(text)), sep="\t"))
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
     def _clean_request(self, counter_id: str | int, request_id: int) -> None:
         try:
-            self.session.delete(f"{API_BASE.format(counter_id=counter_id)}/{request_id}/clean", timeout=60)
+            self.session.delete(f"{self._request_url(counter_id, request_id)}/clean", timeout=60)
         except Exception:
             pass
 
