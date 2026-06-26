@@ -1,0 +1,22 @@
+name: Smoke test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile modules
+        run: python -m py_compile app.py metrika_client.py path_builder.py
+      - name: Import app
+        run: python -c "import app"
+      - name: Import modules
+        run: python -c "import metrika_client; import path_builder"
