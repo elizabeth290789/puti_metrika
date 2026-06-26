@@ -155,14 +155,16 @@ class MetrikaLogsClient:
         if not str(url_filter).strip():
             raise MetrikaAPIError("URL-фильтр обязателен. Нельзя загружать весь счетчик без URL-фильтра.")
         fields = ["ym:s:visitID", "ym:s:clientID", "ym:s:dateTime", "ym:s:startURL", "ym:s:endURL", "ym:s:pageViews", "ym:s:visitDuration", "ym:s:bounce", "ym:s:goalsID", "ym:s:lastTrafficSource", "ym:s:UTMSource", "ym:s:UTMCampaign", "ym:s:deviceCategory"]
-        filt = f"ym:s:startURL=='{self._escape(url_filter)}' OR ym:s:endURL=='{self._escape(url_filter)}'"
+        escaped_url = self._escape(url_filter)
+        filt = f"ym:s:startURL=@'{escaped_url}' OR ym:s:endURL=@'{escaped_url}'"
         return self._fetch(counter_id, "visits", fields, date_from, date_to, filt)
 
     def fetch_hits_for_url(self, counter_id, date_from, date_to, url_filter: str) -> pd.DataFrame:
         if not str(url_filter).strip():
             raise MetrikaAPIError("URL-фильтр обязателен. Нельзя загружать весь счетчик без URL-фильтра.")
         fields = ["ym:pv:visitID", "ym:pv:dateTime", "ym:pv:URL", "ym:pv:title", "ym:pv:referer", "ym:pv:goalsID"]
-        return self._fetch(counter_id, "hits", fields, date_from, date_to, f"ym:pv:URL=='{self._escape(url_filter)}'")
+        escaped_url = self._escape(url_filter)
+        return self._fetch(counter_id, "hits", fields, date_from, date_to, f"ym:pv:URL=@'{escaped_url}'")
 
     def fetch_hits_for_visit_ids(self, counter_id, date_from, date_to, visit_ids: Iterable, batch_size: int = 100, max_elapsed_seconds: int | None = None) -> pd.DataFrame:
         ids = [str(v) for v in visit_ids if str(v).strip()]

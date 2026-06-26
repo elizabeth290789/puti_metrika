@@ -34,6 +34,55 @@ def _csv_button(label: str, df: pd.DataFrame, file_name: str) -> None:
     st.download_button(label, df.to_csv(index=False).encode("utf-8-sig"), file_name=file_name, mime="text/csv", disabled=df.empty)
 
 
+def _first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for column in candidates:
+        if column in df.columns:
+            return column
+    return None
+
+
+def _top_urls(visits: pd.DataFrame, candidates: list[str], limit: int) -> pd.DataFrame:
+    column = _first_existing_column(visits, candidates)
+    if column is None or visits.empty:
+        return pd.DataFrame(columns=["URL", "visits"])
+    top = (
+        visits[column]
+        .fillna("—")
+        .astype(str)
+        .value_counts(dropna=False)
+        .head(limit)
+        .reset_index()
+    )
+    top.columns = ["URL", "visits"]
+    return top
+
+
+def _url_filter_found(top_frames: list[pd.DataFrame], url_filter: str) -> bool:
+    needle = str(url_filter).strip()
+    if not needle:
+        return False
+    for frame in top_frames:
+        if not frame.empty and frame["URL"].astype(str).str.contains(needle, regex=False, na=False).any():
+            return True
+    return False
+
+
+def _show_url_filter_check(visits: pd.DataFrame, url_filter: str) -> None:
+    st.subheader("Проверка URL-фильтра")
+    st.write(f"Введенный URL-фильтр: `{url_filter}`")
+    top_start = _top_urls(visits, ["ym:s:startURL", "startURL"], 10)
+    top_end = _top_urls(visits, ["ym:s:endURL", "endURL"], 10)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.write("Top-10 startURL из выгрузки")
+        st.dataframe(top_start, use_container_width=True, hide_index=True)
+    with c2:
+        st.write("Top-10 endURL из выгрузки")
+        st.dataframe(top_end, use_container_width=True, hide_index=True)
+    if not _url_filter_found([top_start, top_end], url_filter):
+        st.warning("Похоже, URL-фильтр не применился или применился не так. Проверьте синтаксис фильтра.")
+
+
 def _visit_id_column(visits: pd.DataFrame) -> str | None:
     if "ym:s:visitID" in visits.columns:
         return "ym:s:visitID"
@@ -99,6 +148,9 @@ def _show_visits_summary(visits: pd.DataFrame, selected_url: str, date_from, dat
     c4.metric("Выбранный URL", selected_url)
     c5.metric("Период", f"{date_from} — {date_to}")
 
+    st.write("Top-5 startURL")
+    st.dataframe(_top_urls(visits, ["ym:s:startURL", "startURL"], 5), use_container_width=True, hide_index=True)
+
 
 def _reset_hits_state() -> None:
     for key in ["hits", "paths", "sample_visit_ids", "sample_size"]:
@@ -118,7 +170,11 @@ with st.sidebar:
     counter_id = st.text_input("counter_id", value="18477952")
     date_from = st.date_input("date_from", value=yesterday, max_value=yesterday)
     date_to = st.date_input("date_to", value=yesterday, max_value=yesterday)
-    selected_url = st.text_input("selected_url", value="/promo/b24messenger/team/")
+    selected_url = st.text_input(
+        "URL содержит",
+        value="/promo/b24messenger/team/",
+        help="Можно вводить часть адреса, например /promo/free-online-crm/. Приложение найдет визиты, где startURL или endURL содержит эту строку.",
+    )
     goal_ids_raw = st.text_input("ID цели", value="2898778")
     max_steps = st.number_input("Максимум шагов пути", min_value=1, max_value=10, value=3, step=1)
     hits_visit_id_limit = st.selectbox("Максимум visitID для загрузки hits", HITS_VISIT_ID_LIMIT_OPTIONS, index=2)
@@ -189,6 +245,7 @@ if not visits.empty:
     active_counter_id = params.get("counter_id", counter_id)
 
     _show_visits_summary(visits, active_selected_url, active_date_from, active_date_to)
+    _show_url_filter_check(visits, active_selected_url)
     visit_id_col = _visit_id_column(visits)
     visit_ids = visits[visit_id_col].dropna().unique().tolist() if visit_id_col else []
     total_found = len(visit_ids)
