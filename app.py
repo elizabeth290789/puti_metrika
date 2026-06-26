@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 from datetime import date, timedelta
 
 import pandas as pd
@@ -19,7 +18,7 @@ from path_builder import (
     parse_goal_ids,
 )
 
-HITS_VISIT_ID_LIMIT_OPTIONS = [100, 500, 1000, 3000, 5000]
+VISIT_ID_LIMIT_OPTIONS = [100, 500, 1000]
 HITS_TIMEOUT_SECONDS = 180
 
 
@@ -183,9 +182,15 @@ def _show_visits_summary(visits: pd.DataFrame, selected_url: str, date_from, dat
     st.dataframe(_top_urls(visits, ["startURL"], 5), use_container_width=True, hide_index=True)
 
 
-def _reset_hits_state() -> None:
-    for key in ["hits", "paths", "sample_visit_ids", "sample_size"]:
+def _reset_report_state() -> None:
+    for key in ["hits", "paths", "sample_visit_ids", "sample_size", "visits", "matching_hits"]:
         st.session_state.pop(key, None)
+
+
+def _limited_visit_ids_from_hits(hits: pd.DataFrame, limit: int) -> list:
+    if hits.empty or "visitID" not in hits.columns:
+        return []
+    return hits["visitID"].dropna().drop_duplicates().head(limit).tolist()
 
 
 st.set_page_config(page_title="User Path Report", layout="wide")
@@ -204,13 +209,13 @@ with st.sidebar:
     selected_url = st.text_input(
         "URL содержит",
         value="/promo/b24messenger/team/",
-        help="Можно вводить часть адреса, например /promo/free-online-crm/. Приложение найдет визиты, где startURL или endURL содержит эту строку.",
+        help="Можно вводить часть адреса, например /promo/free-online-crm/. Сначала приложение безопасно ищет hits с этим URL и только потом грузит visits по найденным visitID.",
     )
     goal_ids_raw = st.text_input("ID цели", value="2898778")
     max_steps = st.number_input("Максимум шагов пути", min_value=1, max_value=10, value=3, step=1)
-    hits_visit_id_limit = st.selectbox("Максимум visitID для загрузки hits", HITS_VISIT_ID_LIMIT_OPTIONS, index=2)
-    report_mode = st.radio("Режим отчета", ["Быстрый интерактивный отчет", "Полный отчет"], index=0)
+    visit_id_limit = st.selectbox("Максимум visitID для загрузки visits/hits", VISIT_ID_LIMIT_OPTIONS, index=2)
     load_report = st.button("Загрузить отчет", type="primary")
+    clean_requests = st.button("Очистить подготовленные log requests")
 
 st.subheader("1. Статус подключения")
 token = get_metrika_token()
@@ -219,8 +224,20 @@ if token:
 else:
     st.warning("YANDEX_METRIKA_TOKEN не задан. Добавьте токен в Streamlit Secrets.")
 
+if clean_requests:
+    if not token:
+        st.error("Нельзя очистить log requests без YANDEX_METRIKA_TOKEN.")
+    else:
+        try:
+            cleaned = MetrikaLogsClient(token=token).clean_log_requests(counter_id)
+            st.success(f"Отправлена очистка подготовленных log requests: {cleaned}.")
+        except MetrikaAPIError as exc:
+            st.error(str(exc))
+            st.info("Если видите ошибку requested log is too big, очистите подготовленные log requests в Метрике/API или подождите, пока они будут удалены.")
+
+
 if load_report:
-    _reset_hits_state()
+    _reset_report_state()
     if not token:
         st.error("Запрос не выполнен: задайте YANDEX_METRIKA_TOKEN в Streamlit Secrets или переменной окружения.")
         st.stop()
@@ -233,43 +250,48 @@ if load_report:
 
     selected_goal_ids = parse_goal_ids(goal_ids_raw)
     try:
-        client = MetrikaLogsClient(token=token)
-        with st.spinner("Загружаем visits по URL-фильтру..."):
-            visits = client.fetch_visits(counter_id, date_from, date_to, selected_url)
+        client = MetrikaLogsClient(token=token, timeout_seconds=HITS_TIMEOUT_SECONDS)
+        with st.spinner("Шаг 1/3: безопасно ищем hits по выбранному URL..."):
+            matching_hits = client.fetch_hits_for_url(counter_id, date_from, date_to, selected_url)
+        matching_hits = normalize_metrika_columns(matching_hits)
+        if matching_hits.empty or "visitID" not in matching_hits.columns:
+            st.info("По URL ничего не найдено. Попробуйте полный URL или проверьте дату.")
+            st.stop()
+
+        matching_visit_ids = matching_hits["visitID"].dropna().drop_duplicates().tolist()
+        total_found = len(matching_visit_ids)
+        st.success(f"Найдено visitID с выбранным URL: {total_found}")
+        selected_visit_ids = _limited_visit_ids_from_hits(matching_hits, int(visit_id_limit))
+        if total_found > len(selected_visit_ids):
+            st.warning(f"Найдено {total_found} visitID. По лимиту сайдбара загружаем только первые {len(selected_visit_ids)}.")
+
+        with st.spinner(f"Шаг 2/3: загружаем visits только по {len(selected_visit_ids)} visitID..."):
+            visits = client.fetch_visits_for_visit_ids(counter_id, date_from, date_to, selected_visit_ids)
         visits = normalize_metrika_columns(visits)
         if visits.empty:
-            st.info("По выбранным параметрам данных нет. Проверьте дату, URL-фильтр и ID цели.")
-            st.session_state.visits = pd.DataFrame()
+            st.info("По найденным visitID данные visits не вернулись.")
             st.stop()
-        visits_before_client_filter = len(visits)
-        visits = _client_url_filter(visits, selected_url)
-        visits_after_client_filter = len(visits)
-        if visits.empty:
-            st.info("По введенному URL ничего не найдено. Попробуйте полный URL или проверьте путь.")
-            st.session_state.visits = pd.DataFrame()
-            st.session_state.report_params = {
-                "counter_id": counter_id,
-                "date_from": date_from,
-                "date_to": date_to,
-                "selected_url": selected_url,
-                "goal_ids_raw": goal_ids_raw,
-                "selected_goal_ids": sorted(selected_goal_ids),
-                "max_steps": int(max_steps),
-                "hits_visit_id_limit": int(hits_visit_id_limit),
-                "report_mode": report_mode,
-                "visits_before_client_filter": visits_before_client_filter,
-                "visits_after_client_filter": visits_after_client_filter,
-            }
+        visits = mark_target_reached(visits, selected_goal_ids)
+
+        with st.spinner(f"Шаг 3/3: загружаем full hits только по {len(selected_visit_ids)} visitID и строим пути..."):
+            hits = client.fetch_hits_for_visit_ids(counter_id, date_from, date_to, selected_visit_ids, max_elapsed_seconds=HITS_TIMEOUT_SECONDS)
+        hits = normalize_metrika_columns(hits)
+        if hits.empty:
+            st.error("Не удалось загрузить hits по выбранным visitID. Нельзя построить путь.")
             st.stop()
 
         visit_id_col = _visit_id_column(visits)
-        if visit_id_col is None:
-            st.error("В данных visits нет колонки visitID. Невозможно загрузить hits для путей.")
-            st.session_state.visits = pd.DataFrame()
-            st.stop()
+        sampled_visits = visits[visits[visit_id_col].astype(str).isin({str(v) for v in selected_visit_ids})] if visit_id_col else visits
+        paths = build_paths(sampled_visits, hits, selected_url, int(max_steps))
+        if paths.empty:
+            st.info("Выбранный URL не найден внутри цепочек hits. Проверьте дату и URL-фильтр.")
 
-        visits = mark_target_reached(visits, selected_goal_ids)
         st.session_state.visits = visits
+        st.session_state.matching_hits = matching_hits
+        st.session_state.hits = hits
+        st.session_state.paths = paths
+        st.session_state.sample_visit_ids = selected_visit_ids
+        st.session_state.sample_size = len(selected_visit_ids)
         st.session_state.report_params = {
             "counter_id": counter_id,
             "date_from": date_from,
@@ -278,95 +300,47 @@ if load_report:
             "goal_ids_raw": goal_ids_raw,
             "selected_goal_ids": sorted(selected_goal_ids),
             "max_steps": int(max_steps),
-            "hits_visit_id_limit": int(hits_visit_id_limit),
-            "report_mode": report_mode,
-            "visits_before_client_filter": visits_before_client_filter,
-            "visits_after_client_filter": visits_after_client_filter,
+            "visit_id_limit": int(visit_id_limit),
+            "total_found": total_found,
+            "server_filter_mode": str(matching_hits.get("server_filter_mode", pd.Series(["—"])).iloc[0]) if not matching_hits.empty else "—",
         }
     except MetrikaAPIError as exc:
         st.error(str(exc))
+        if "слишком" in str(exc).lower() or "too big" in str(exc).lower():
+            st.info("Серверный URL-фильтр не сработал, Logs API пытается выгрузить слишком много данных. Попробуйте полный URL или более узкий период.")
     except Exception as exc:
         st.exception(exc)
 
 visits = st.session_state.get("visits", pd.DataFrame())
 params = st.session_state.get("report_params", {})
+paths = st.session_state.get("paths", pd.DataFrame())
+hits = st.session_state.get("hits", pd.DataFrame())
+matching_hits = st.session_state.get("matching_hits", pd.DataFrame())
+
 if not visits.empty:
     active_selected_url = params.get("selected_url", selected_url)
     active_date_from = params.get("date_from", date_from)
     active_date_to = params.get("date_to", date_to)
-    active_limit = int(params.get("hits_visit_id_limit", hits_visit_id_limit))
-    active_mode = params.get("report_mode", report_mode)
-    active_max_steps = int(params.get("max_steps", max_steps))
-    active_counter_id = params.get("counter_id", counter_id)
-
     active_goal_ids = set(params.get("selected_goal_ids", parse_goal_ids(params.get("goal_ids_raw", goal_ids_raw))))
-    _show_visits_summary(visits, active_selected_url, active_date_from, active_date_to, params.get("visits_before_client_filter"))
+    st.subheader("2. Найденные visitID и ограниченная выгрузка")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Найдено visitID с URL", params.get("total_found", 0))
+    c2.metric("Загружено visits", len(visits))
+    c3.metric("Лимит visitID", params.get("visit_id_limit", visit_id_limit))
+    c4.metric("Режим URL-фильтра", params.get("server_filter_mode", "—"))
+    st.caption("Отчет начинается с маленькой выгрузки hits по URL. Visits и full hits загружаются только по найденным visitID через IN (...), без fallback на выгрузку всего счетчика.")
     _show_goal_debug(visits, active_goal_ids)
-    _show_url_filter_check(visits, active_selected_url)
-    visit_id_col = _visit_id_column(visits)
-    visit_ids = visits[visit_id_col].dropna().unique().tolist() if visit_id_col else []
-    total_found = len(visit_ids)
 
-    if active_mode == "Полный отчет":
-        st.info("Полный несемплированный отчет для большого счетчика нужно считать отдельным батч-процессом, не в синхронном Streamlit-запросе.")
-    else:
-        selected_visit_ids = _representative_visit_ids(visits, active_limit, visit_id_col) if visit_id_col else []
-        sample_size = len(selected_visit_ids)
-        if total_found > active_limit:
-            st.warning(
-                f"Найдено {total_found} визитов. Для интерактивного отчета по путям будут загружены hits только для первых/выбранных {sample_size} visitID. "
-                "Для полного несемплированного отчета нужен отдельный offline-режим/батч-выгрузка."
-            )
-            st.info("Быстрый интерактивный отчет будет построен по ограниченной репрезентативной выборке visitID, а не по всем найденным визитам.")
-        else:
-            st.info(f"Найдено {total_found} visitID — это не больше лимита {active_limit}, hits можно загрузить для всех найденных visitID.")
+    if not matching_hits.empty:
+        with st.expander("Hits, по которым найдены visitID", expanded=False):
+            st.dataframe(matching_hits.head(100), use_container_width=True)
 
-        load_hits = st.button("Загрузить hits и построить пути", type="primary")
-        if load_hits:
-            if not token:
-                st.error("Запрос не выполнен: задайте YANDEX_METRIKA_TOKEN в Streamlit Secrets или переменной окружения.")
-                st.stop()
-            if not selected_visit_ids:
-                st.error("Нет visitID для загрузки hits.")
-                st.stop()
-            try:
-                client = MetrikaLogsClient(token=token, timeout_seconds=HITS_TIMEOUT_SECONDS)
-                started_at = time.monotonic()
-                with st.spinner(f"Загружаем hits для {sample_size} visitID из {total_found} найденных..."):
-                    hits = client.fetch_hits_for_visit_ids(active_counter_id, active_date_from, active_date_to, selected_visit_ids, max_elapsed_seconds=HITS_TIMEOUT_SECONDS)
-                hits = normalize_metrika_columns(hits)
-                elapsed = time.monotonic() - started_at
-                if elapsed > HITS_TIMEOUT_SECONDS:
-                    st.warning("Загрузка hits заняла больше 3 минут. Для больших объемов используйте отдельный offline-режим/батч-выгрузку, а не синхронный Streamlit-запрос.")
-                if hits.empty:
-                    st.error("Не удалось загрузить hits по выбранным visitID. Нельзя построить путь.")
-                    st.stop()
-
-                sampled_visits = visits[visits[visit_id_col].astype(str).isin({str(v) for v in selected_visit_ids})]
-                paths = build_paths(sampled_visits, hits, active_selected_url, active_max_steps)
-                if paths.empty:
-                    st.info("Выбранный URL не найден внутри цепочек hits. Проверьте дату, URL-фильтр и ID цели.")
-                    st.stop()
-                st.session_state.hits = hits
-                st.session_state.paths = paths
-                st.session_state.sample_visit_ids = selected_visit_ids
-                st.session_state.sample_size = sample_size
-            except MetrikaAPIError as exc:
-                if "Превышено время ожидания" in str(exc) or "дольше 3 минут" in str(exc):
-                    st.error("Загрузка hits идет дольше 3 минут. Остановили синхронный запрос: для большого счетчика нужен offline-режим/батч-выгрузка.")
-                else:
-                    st.error(str(exc))
-            except Exception as exc:
-                st.exception(exc)
-
-    paths = st.session_state.get("paths", pd.DataFrame())
-    hits = st.session_state.get("hits", pd.DataFrame())
     if not paths.empty:
         next_steps = aggregate_next_steps(paths)
         top_paths = aggregate_top_paths(paths)
         watchlist = build_watchlist(paths)
 
-        st.subheader("3. Сводка по быстрым путям")
+        st.subheader("3. Сводка по путям")
         total_paths = len(paths)
         target_paths = int(paths["target_reached"].sum()) if "target_reached" in paths.columns else 0
         cr_paths = target_paths / total_paths if total_paths else 0
@@ -400,13 +374,13 @@ if not visits.empty:
         with e3:
             _csv_button("CSV: visitID для проверки", watchlist, "watchlist.csv")
 
-        with st.expander("Отладка", expanded=False):
-            st.write("Первые 50 строк visits")
-            st.dataframe(visits.head(50), use_container_width=True)
-            st.write("Первые 50 строк hits")
-            st.dataframe(hits.head(50), use_container_width=True)
-            st.write("Первые 50 строк paths")
-            st.dataframe(paths.head(50), use_container_width=True)
-            st.write("Выбранные goal_ids", sorted(parse_goal_ids(params.get("goal_ids_raw", goal_ids_raw))))
+    with st.expander("Отладка", expanded=False):
+        st.write("Первые 50 строк visits")
+        st.dataframe(visits.head(50), use_container_width=True)
+        st.write("Первые 50 строк full hits")
+        st.dataframe(hits.head(50), use_container_width=True)
+        st.write("Первые 50 строк paths")
+        st.dataframe(paths.head(50), use_container_width=True)
+        st.write("Выбранные goal_ids", sorted(parse_goal_ids(params.get("goal_ids_raw", goal_ids_raw))))
 elif not load_report:
-    st.info("Задайте параметры в сайдбаре и нажмите «Загрузить отчет». Сначала загрузятся только visits; hits загружаются отдельной кнопкой после сводки.")
+    st.info("Задайте параметры в сайдбаре и нажмите «Загрузить отчет». Сначала загрузятся маленькие hits по URL, затем visits и full hits только по найденным visitID.")
