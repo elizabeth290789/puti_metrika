@@ -15,6 +15,7 @@ from path_builder import (
     build_paths,
     build_watchlist,
     mark_target_reached,
+    normalize_metrika_columns,
     parse_goal_ids,
 )
 
@@ -70,8 +71,8 @@ def _url_filter_found(top_frames: list[pd.DataFrame], url_filter: str) -> bool:
 def _show_url_filter_check(visits: pd.DataFrame, url_filter: str) -> None:
     st.subheader("Проверка URL-фильтра")
     st.write(f"Введенный URL-фильтр: `{url_filter}`")
-    top_start = _top_urls(visits, ["ym:s:startURL", "startURL"], 10)
-    top_end = _top_urls(visits, ["ym:s:endURL", "endURL"], 10)
+    top_start = _top_urls(visits, ["startURL"], 10)
+    top_end = _top_urls(visits, ["endURL"], 10)
     c1, c2 = st.columns(2)
     with c1:
         st.write("Top-10 startURL из выгрузки")
@@ -84,11 +85,23 @@ def _show_url_filter_check(visits: pd.DataFrame, url_filter: str) -> None:
 
 
 def _visit_id_column(visits: pd.DataFrame) -> str | None:
-    if "ym:s:visitID" in visits.columns:
-        return "ym:s:visitID"
     if "visitID" in visits.columns:
         return "visitID"
     return None
+
+
+def _client_url_filter(visits: pd.DataFrame, url_filter: str) -> pd.DataFrame:
+    """Keep only visits where startURL or endURL contains the user URL filter."""
+    needle = str(url_filter).strip()
+    if visits.empty or not needle:
+        return visits.copy()
+    start_matches = visits.get("startURL", pd.Series(False, index=visits.index)).astype(str).str.contains(
+        needle, regex=False, case=False, na=False
+    )
+    end_matches = visits.get("endURL", pd.Series(False, index=visits.index)).astype(str).str.contains(
+        needle, regex=False, case=False, na=False
+    )
+    return visits[start_matches | end_matches].copy()
 
 
 def _representative_visit_ids(visits: pd.DataFrame, limit: int, visit_id_col: str) -> list:
@@ -100,9 +113,9 @@ def _representative_visit_ids(visits: pd.DataFrame, limit: int, visit_id_col: st
     if len(work) <= limit:
         return work[visit_id_col].tolist()
 
-    pageviews_col = "pageViews" if "pageViews" in work.columns else "ym:s:pageViews"
-    duration_col = "visitDuration" if "visitDuration" in work.columns else "ym:s:visitDuration"
-    bounce_col = "bounce" if "bounce" in work.columns else "ym:s:bounce"
+    pageviews_col = "pageViews"
+    duration_col = "visitDuration"
+    bounce_col = "bounce"
     work["pageViews_numeric"] = pd.to_numeric(work[pageviews_col], errors="coerce").fillna(0) if pageviews_col in work.columns else 0
     work["visitDuration_numeric"] = pd.to_numeric(work[duration_col], errors="coerce").fillna(0) if duration_col in work.columns else 0
     work["bounce_numeric"] = pd.to_numeric(work[bounce_col], errors="coerce").fillna(0) if bounce_col in work.columns else 0
@@ -136,20 +149,38 @@ def _representative_visit_ids(visits: pd.DataFrame, limit: int, visit_id_col: st
     return selected[:limit]
 
 
-def _show_visits_summary(visits: pd.DataFrame, selected_url: str, date_from, date_to) -> None:
+def _show_goal_debug(visits: pd.DataFrame, selected_goal_ids: set[str]) -> None:
+    goals = visits["goalsID"] if "goalsID" in visits.columns else pd.Series(dtype=object)
+    non_empty_goals = int(goals.apply(lambda value: bool(parse_goal_ids(value))).sum()) if not goals.empty else 0
+    matched_goals = int(visits["target_reached"].sum()) if "target_reached" in visits.columns else 0
+    with st.expander("Отладка целей", expanded=False):
+        st.write("Введенные ID целей")
+        st.write(sorted(selected_goal_ids))
+        st.write("Визитов с непустым goalsID")
+        st.write(non_empty_goals)
+        st.write("Визитов с выбранной целью")
+        st.write(matched_goals)
+
+
+def _show_visits_summary(visits: pd.DataFrame, selected_url: str, date_from, date_to, before_filter: int | None = None) -> None:
     st.subheader("2. Сводка по visits")
     total_visits = len(visits)
+    before_filter = total_visits if before_filter is None else int(before_filter)
     target_visits = int(visits["target_reached"].sum()) if "target_reached" in visits.columns else 0
     cr = target_visits / total_visits if total_visits else 0
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Найдено visits", total_visits)
-    c2.metric("Visits с целью", target_visits)
-    c3.metric("CR", f"{cr:.2%}")
-    c4.metric("Выбранный URL", selected_url)
-    c5.metric("Период", f"{date_from} — {date_to}")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("visits_before_client_filter", before_filter)
+    c2.metric("visits_after_client_filter", total_visits)
+    c3.metric("Visits с целью", target_visits)
+    c4.metric("CR", f"{cr:.2%}")
+    c5.metric("Выбранный URL", selected_url)
+    c6.metric("Период", f"{date_from} — {date_to}")
+
+    if before_filter > total_visits:
+        st.warning("Серверный фильтр Logs API вернул лишние данные. Отчет построен после дополнительной клиентской фильтрации.")
 
     st.write("Top-5 startURL")
-    st.dataframe(_top_urls(visits, ["ym:s:startURL", "startURL"], 5), use_container_width=True, hide_index=True)
+    st.dataframe(_top_urls(visits, ["startURL"], 5), use_container_width=True, hide_index=True)
 
 
 def _reset_hits_state() -> None:
@@ -205,9 +236,30 @@ if load_report:
         client = MetrikaLogsClient(token=token)
         with st.spinner("Загружаем visits по URL-фильтру..."):
             visits = client.fetch_visits(counter_id, date_from, date_to, selected_url)
+        visits = normalize_metrika_columns(visits)
         if visits.empty:
             st.info("По выбранным параметрам данных нет. Проверьте дату, URL-фильтр и ID цели.")
             st.session_state.visits = pd.DataFrame()
+            st.stop()
+        visits_before_client_filter = len(visits)
+        visits = _client_url_filter(visits, selected_url)
+        visits_after_client_filter = len(visits)
+        if visits.empty:
+            st.info("По введенному URL ничего не найдено. Попробуйте полный URL или проверьте путь.")
+            st.session_state.visits = pd.DataFrame()
+            st.session_state.report_params = {
+                "counter_id": counter_id,
+                "date_from": date_from,
+                "date_to": date_to,
+                "selected_url": selected_url,
+                "goal_ids_raw": goal_ids_raw,
+                "selected_goal_ids": sorted(selected_goal_ids),
+                "max_steps": int(max_steps),
+                "hits_visit_id_limit": int(hits_visit_id_limit),
+                "report_mode": report_mode,
+                "visits_before_client_filter": visits_before_client_filter,
+                "visits_after_client_filter": visits_after_client_filter,
+            }
             st.stop()
 
         visit_id_col = _visit_id_column(visits)
@@ -224,9 +276,12 @@ if load_report:
             "date_to": date_to,
             "selected_url": selected_url,
             "goal_ids_raw": goal_ids_raw,
+            "selected_goal_ids": sorted(selected_goal_ids),
             "max_steps": int(max_steps),
             "hits_visit_id_limit": int(hits_visit_id_limit),
             "report_mode": report_mode,
+            "visits_before_client_filter": visits_before_client_filter,
+            "visits_after_client_filter": visits_after_client_filter,
         }
     except MetrikaAPIError as exc:
         st.error(str(exc))
@@ -244,7 +299,9 @@ if not visits.empty:
     active_max_steps = int(params.get("max_steps", max_steps))
     active_counter_id = params.get("counter_id", counter_id)
 
-    _show_visits_summary(visits, active_selected_url, active_date_from, active_date_to)
+    active_goal_ids = set(params.get("selected_goal_ids", parse_goal_ids(params.get("goal_ids_raw", goal_ids_raw))))
+    _show_visits_summary(visits, active_selected_url, active_date_from, active_date_to, params.get("visits_before_client_filter"))
+    _show_goal_debug(visits, active_goal_ids)
     _show_url_filter_check(visits, active_selected_url)
     visit_id_col = _visit_id_column(visits)
     visit_ids = visits[visit_id_col].dropna().unique().tolist() if visit_id_col else []
@@ -277,6 +334,7 @@ if not visits.empty:
                 started_at = time.monotonic()
                 with st.spinner(f"Загружаем hits для {sample_size} visitID из {total_found} найденных..."):
                     hits = client.fetch_hits_for_visit_ids(active_counter_id, active_date_from, active_date_to, selected_visit_ids, max_elapsed_seconds=HITS_TIMEOUT_SECONDS)
+                hits = normalize_metrika_columns(hits)
                 elapsed = time.monotonic() - started_at
                 if elapsed > HITS_TIMEOUT_SECONDS:
                     st.warning("Загрузка hits заняла больше 3 минут. Для больших объемов используйте отдельный offline-режим/батч-выгрузку, а не синхронный Streamlit-запрос.")

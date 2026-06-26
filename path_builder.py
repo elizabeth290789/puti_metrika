@@ -11,6 +11,28 @@ import pandas as pd
 EMPTY_URL = "—"
 EXIT_URL = "Выход"
 
+METRIKA_COLUMN_MAPPING = {
+    "ym:s:visitID": "visitID",
+    "ym:s:clientID": "clientID",
+    "ym:s:dateTime": "dateTime",
+    "ym:s:startURL": "startURL",
+    "ym:s:endURL": "endURL",
+    "ym:s:pageViews": "pageViews",
+    "ym:s:visitDuration": "visitDuration",
+    "ym:s:bounce": "bounce",
+    "ym:s:goalsID": "goalsID",
+    "ym:s:lastTrafficSource": "lastTrafficSource",
+    "ym:s:UTMSource": "UTMSource",
+    "ym:s:UTMCampaign": "UTMCampaign",
+    "ym:s:deviceCategory": "deviceCategory",
+    "ym:pv:visitID": "visitID",
+    "ym:pv:dateTime": "dateTime",
+    "ym:pv:URL": "URL",
+    "ym:pv:title": "title",
+    "ym:pv:referer": "referer",
+    "ym:pv:goalsID": "goalsID",
+}
+
 
 def normalize_url(url) -> str:
     """Normalize URL to path without query parameters."""
@@ -38,6 +60,13 @@ def parse_goal_ids(value) -> set[str]:
     return ids
 
 
+def normalize_metrika_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Rename known Yandex Metrika Logs API columns to short names."""
+    if df.empty:
+        return df.copy()
+    return df.rename(columns={column: METRIKA_COLUMN_MAPPING[column] for column in df.columns if column in METRIKA_COLUMN_MAPPING})
+
+
 def _coerce_goal_set(selected_goal_ids: Iterable) -> set[str]:
     result: set[str] = set()
     for value in selected_goal_ids or []:
@@ -57,8 +86,7 @@ def mark_target_reached(visits_df: pd.DataFrame, selected_goal_ids: Iterable) ->
 
 
 def _rename_metrika_columns(df: pd.DataFrame) -> pd.DataFrame:
-    mapping = {col: col.split(":")[-1] for col in df.columns if col.startswith(("ym:s:", "ym:pv:"))}
-    return df.rename(columns=mapping)
+    return normalize_metrika_columns(df)
 
 
 def _dedupe_consecutive(values: list[str]) -> list[str]:
