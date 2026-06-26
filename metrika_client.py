@@ -164,17 +164,24 @@ class MetrikaLogsClient:
         fields = ["ym:pv:visitID", "ym:pv:dateTime", "ym:pv:URL", "ym:pv:title", "ym:pv:referer", "ym:pv:goalsID"]
         return self._fetch(counter_id, "hits", fields, date_from, date_to, f"ym:pv:URL=='{self._escape(url_filter)}'")
 
-    def fetch_hits_for_visit_ids(self, counter_id, date_from, date_to, visit_ids: Iterable, batch_size: int = 100) -> pd.DataFrame:
+    def fetch_hits_for_visit_ids(self, counter_id, date_from, date_to, visit_ids: Iterable, batch_size: int = 100, max_elapsed_seconds: int | None = None) -> pd.DataFrame:
         ids = [str(v) for v in visit_ids if str(v).strip()]
         if not ids:
             return pd.DataFrame()
         fields = ["ym:pv:visitID", "ym:pv:dateTime", "ym:pv:URL", "ym:pv:title", "ym:pv:referer", "ym:pv:goalsID"]
         frames = []
+        started_at = time.monotonic()
         try:
             for idx in range(0, len(ids), batch_size):
+                if max_elapsed_seconds is not None and time.monotonic() - started_at > max_elapsed_seconds:
+                    raise MetrikaAPIError("Загрузка hits идет дольше 3 минут.")
                 batch = ids[idx : idx + batch_size]
                 filters = "ym:pv:visitID IN (" + ",".join(batch) + ")"
                 frames.append(self._fetch(counter_id, "hits", fields, date_from, date_to, filters))
+                if max_elapsed_seconds is not None and time.monotonic() - started_at > max_elapsed_seconds:
+                    raise MetrikaAPIError("Загрузка hits идет дольше 3 минут.")
         except MetrikaAPIError as exc:
-            raise MetrikaAPIError("Не удалось загрузить hits по visitID. Нельзя построить полный путь. Проверьте синтаксис фильтра Logs API или используйте более узкую дату/URL.") from exc
+            if "дольше 3 минут" in str(exc):
+                raise
+            raise MetrikaAPIError("Не удалось загрузить hits по visitID. Нельзя построить путь. Проверьте синтаксис фильтра Logs API или используйте более узкую дату/URL.") from exc
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
