@@ -76,6 +76,20 @@ class MetrikaLogsClient:
         except Exception:
             return response.text[:500]
 
+    @staticmethod
+    def _humanize_error(message: str) -> str:
+        lower = str(message).lower()
+        if "requested log is too big" in lower:
+            return (
+                "Запрос слишком широкий: серверный URL-фильтр не сработал, Logs API пытается выгрузить слишком много данных. "
+                "Попробуйте полный URL или более узкий период. Не запускаем fallback на выгрузку всего счетчика."
+            )
+        if "invalid filter" in lower or "incorrect filter" in lower:
+            return "Синтаксис фильтра не принят Logs API. Попробуйте полный URL или более простой путь."
+        if "no data" in lower or "not found" in lower:
+            return "По URL ничего не найдено. Проверьте дату, URL и счетчик."
+        return str(message)
+
     def _handle_json_response(self, response: requests.Response, context: str, endpoint: str) -> dict:
         if response.ok:
             try:
@@ -86,14 +100,14 @@ class MetrikaLogsClient:
                 raise MetrikaAPIError(f"API вернул невалидный JSON на этапе {context}.")
             return payload
 
-        message = self._extract_error_message(response)
+        message = self._humanize_error(self._extract_error_message(response))
         raise MetrikaAPIError(f"Ошибка Logs API ({context}): HTTP {response.status_code}. Endpoint: {endpoint}. {message}")
 
     def _handle_text_response(self, response: requests.Response, context: str, endpoint: str) -> str:
         if response.ok:
             return response.text
 
-        message = self._extract_error_message(response)
+        message = self._humanize_error(self._extract_error_message(response))
         raise MetrikaAPIError(f"Ошибка Logs API ({context}): HTTP {response.status_code}. Endpoint: {endpoint}. {message}")
 
     def _create_request(self, counter_id: str | int, source: str, fields: list[str], date_from, date_to, filters: str) -> int:
@@ -141,6 +155,22 @@ class MetrikaLogsClient:
         except Exception:
             pass
 
+    def list_log_requests(self, counter_id: str | int) -> list[dict]:
+        self._require_token()
+        url = self._create_request_url(counter_id)
+        data = self._handle_json_response(self.session.get(url, timeout=60), "список запросов", url)
+        return data.get("requests") or data.get("log_requests") or []
+
+    def clean_log_requests(self, counter_id: str | int) -> int:
+        cleaned = 0
+        for request in self.list_log_requests(counter_id):
+            request_id = request.get("request_id") or request.get("log_request", {}).get("request_id")
+            if request_id is None:
+                continue
+            self._clean_request(counter_id, int(request_id))
+            cleaned += 1
+        return cleaned
+
     def _fetch(self, counter_id, source: str, fields: list[str], date_from, date_to, filters: str) -> pd.DataFrame:
         request_id = self._create_request(counter_id, source, fields, date_from, date_to, filters)
         try:
@@ -153,26 +183,79 @@ class MetrikaLogsClient:
     def _escape(value: str) -> str:
         return str(value).replace("'", "\\'")
 
+    @staticmethod
+    def _visit_fields() -> list[str]:
+        return [
+            "ym:s:visitID", "ym:s:clientID", "ym:s:dateTime", "ym:s:startURL", "ym:s:endURL",
+            "ym:s:pageViews", "ym:s:visitDuration", "ym:s:bounce", "ym:s:goalsID",
+            "ym:s:lastTrafficSource", "ym:s:UTMSource", "ym:s:UTMCampaign", "ym:s:deviceCategory",
+        ]
+
+    @staticmethod
+    def _minimal_hit_fields() -> list[str]:
+        return ["ym:pv:visitID", "ym:pv:dateTime", "ym:pv:URL"]
+
+    @staticmethod
+    def _full_hit_fields() -> list[str]:
+        return ["ym:pv:visitID", "ym:pv:dateTime", "ym:pv:URL", "ym:pv:title", "ym:pv:referer", "ym:pv:goalsID"]
+
     def fetch_visits(self, counter_id, date_from, date_to, url_filter: str) -> pd.DataFrame:
-        if not str(url_filter).strip():
-            raise MetrikaAPIError("URL-фильтр обязателен. Нельзя загружать весь счетчик без URL-фильтра.")
-        fields = ["ym:s:visitID", "ym:s:clientID", "ym:s:dateTime", "ym:s:startURL", "ym:s:endURL", "ym:s:pageViews", "ym:s:visitDuration", "ym:s:bounce", "ym:s:goalsID", "ym:s:lastTrafficSource", "ym:s:UTMSource", "ym:s:UTMCampaign", "ym:s:deviceCategory"]
-        escaped_url = self._escape(url_filter)
-        filt = f"ym:s:startURL=@'{escaped_url}' OR ym:s:endURL=@'{escaped_url}'"
-        return normalize_metrika_columns(self._fetch(counter_id, "visits", fields, date_from, date_to, filt))
+        raise MetrikaAPIError("Небезопасный первый шаг отключен: сначала найдите visitID через hits по URL, затем загрузите visits по visitID.")
+
+    def _url_filter_variants(self, url_filter: str) -> list[tuple[str, str]]:
+        raw = str(url_filter).strip()
+        escaped = self._escape(raw)
+        variants = [("contains", f"ym:pv:URL=@'{escaped}'"), ("regexp", f"ym:pv:URL=~'.*{escaped}.*'")]
+        if raw.startswith("/"):
+            for host in ("https://www.bitrix24.ru", "https://bitrix24.ru"):
+                full_url = self._escape(host + raw)
+                variants.extend([
+                    (f"exact {host}", f"ym:pv:URL=='{full_url}'"),
+                    (f"contains {host}", f"ym:pv:URL=@'{full_url}'"),
+                ])
+        return variants
 
     def fetch_hits_for_url(self, counter_id, date_from, date_to, url_filter: str) -> pd.DataFrame:
         if not str(url_filter).strip():
             raise MetrikaAPIError("URL-фильтр обязателен. Нельзя загружать весь счетчик без URL-фильтра.")
-        fields = ["ym:pv:visitID", "ym:pv:dateTime", "ym:pv:URL", "ym:pv:title", "ym:pv:referer", "ym:pv:goalsID"]
-        escaped_url = self._escape(url_filter)
-        return normalize_metrika_columns(self._fetch(counter_id, "hits", fields, date_from, date_to, f"ym:pv:URL=@'{escaped_url}'"))
+        errors = []
+        for label, filters in self._url_filter_variants(url_filter):
+            try:
+                data = normalize_metrika_columns(self._fetch(counter_id, "hits", self._minimal_hit_fields(), date_from, date_to, filters))
+                if not data.empty:
+                    data["server_filter_mode"] = label
+                    return data
+            except MetrikaAPIError as exc:
+                text = str(exc)
+                errors.append(text)
+                if "Запрос слишком широкий" in text:
+                    continue
+                if "Синтаксис фильтра не принят" in text:
+                    continue
+                raise
+        if any("Запрос слишком широкий" in err for err in errors):
+            raise MetrikaAPIError(
+                "Серверный URL-фильтр не сработал, Logs API пытается выгрузить слишком много данных. "
+                "Попробуйте полный URL или более узкий период."
+            )
+        raise MetrikaAPIError("По URL ничего не найдено. Проверьте дату, URL и счетчик.")
+
+    def fetch_visits_for_visit_ids(self, counter_id, date_from, date_to, visit_ids: Iterable, batch_size: int = 100) -> pd.DataFrame:
+        ids = [str(v) for v in visit_ids if str(v).strip()]
+        if not ids:
+            return pd.DataFrame()
+        frames = []
+        for idx in range(0, len(ids), batch_size):
+            batch = ids[idx : idx + batch_size]
+            filters = "ym:s:visitID IN (" + ",".join(batch) + ")"
+            frames.append(normalize_metrika_columns(self._fetch(counter_id, "visits", self._visit_fields(), date_from, date_to, filters)))
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
     def fetch_hits_for_visit_ids(self, counter_id, date_from, date_to, visit_ids: Iterable, batch_size: int = 100, max_elapsed_seconds: int | None = None) -> pd.DataFrame:
         ids = [str(v) for v in visit_ids if str(v).strip()]
         if not ids:
             return pd.DataFrame()
-        fields = ["ym:pv:visitID", "ym:pv:dateTime", "ym:pv:URL", "ym:pv:title", "ym:pv:referer", "ym:pv:goalsID"]
+        fields = self._full_hit_fields()
         frames = []
         started_at = time.monotonic()
         try:
