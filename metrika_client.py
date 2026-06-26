@@ -65,16 +65,33 @@ class MetrikaLogsClient:
     def _request_url(counter_id: str | int, request_id: int) -> str:
         return LOGREQUEST_ENDPOINT.format(counter_id=counter_id, request_id=request_id)
 
-    def _handle_response(self, response: requests.Response, context: str, endpoint: str) -> dict | str:
-        if response.ok:
-            content_type = response.headers.get("content-type", "")
-            return response.json() if "json" in content_type else response.text
-        message = ""
+    @staticmethod
+    def _extract_error_message(response: requests.Response) -> str:
         try:
             payload = response.json()
             message = payload.get("message") or payload.get("errors", [{}])[0].get("message", "")
+            return message or response.text[:500]
         except Exception:
-            message = response.text[:500]
+            return response.text[:500]
+
+    def _handle_json_response(self, response: requests.Response, context: str, endpoint: str) -> dict:
+        if response.ok:
+            try:
+                payload = response.json()
+            except Exception as exc:
+                raise MetrikaAPIError(f"API вернул невалидный JSON на этапе {context}.") from exc
+            if not payload:
+                raise MetrikaAPIError(f"API вернул невалидный JSON на этапе {context}.")
+            return payload
+
+        message = self._extract_error_message(response)
+        raise MetrikaAPIError(f"Ошибка Logs API ({context}): HTTP {response.status_code}. Endpoint: {endpoint}. {message}")
+
+    def _handle_text_response(self, response: requests.Response, context: str, endpoint: str) -> str:
+        if response.ok:
+            return response.text
+
+        message = self._extract_error_message(response)
         raise MetrikaAPIError(f"Ошибка Logs API ({context}): HTTP {response.status_code}. Endpoint: {endpoint}. {message}")
 
     def _create_request(self, counter_id: str | int, source: str, fields: list[str], date_from, date_to, filters: str) -> int:
@@ -82,7 +99,7 @@ class MetrikaLogsClient:
         params = {"date1": str(date_from), "date2": str(date_to), "source": source, "fields": ",".join(fields), "filters": filters}
         url = self._create_request_url(counter_id)
         response = self.session.post(url, params=params, timeout=60)
-        data = self._handle_response(response, "создание запроса", url)
+        data = self._handle_json_response(response, "создание запроса", url)
         return int(data["log_request"]["request_id"])
 
     def _wait_processed(self, counter_id: str | int, request_id: int) -> list[dict]:
@@ -90,7 +107,7 @@ class MetrikaLogsClient:
         url = self._request_url(counter_id, request_id)
         while time.time() < deadline:
             response = self.session.get(url, timeout=60)
-            data = self._handle_response(response, "проверка статуса", url)
+            data = self._handle_json_response(response, "проверка статуса", url)
             request = data.get("log_request", {})
             status = request.get("status")
             if status == "processed":
@@ -107,9 +124,13 @@ class MetrikaLogsClient:
             part_number = part.get("part_number")
             url = f"{self._request_url(counter_id, request_id)}/part/{part_number}/download"
             response = self.session.get(url, timeout=120)
-            text = self._handle_response(response, "скачивание данных", url)
-            if str(text).strip():
-                frames.append(pd.read_csv(io.StringIO(str(text)), sep="\t"))
+            text = self._handle_text_response(response, "скачивание данных", url)
+            if not text.strip():
+                continue
+            try:
+                frames.append(pd.read_csv(io.StringIO(text), sep="\t"))
+            except Exception as exc:
+                raise MetrikaAPIError("Не удалось прочитать part-файл Logs API как TSV.") from exc
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
     def _clean_request(self, counter_id: str | int, request_id: int) -> None:
