@@ -202,43 +202,48 @@ class MetrikaLogsClient:
     def fetch_visits(self, counter_id, date_from, date_to, url_filter: str) -> pd.DataFrame:
         raise MetrikaAPIError("Небезопасный первый шаг отключен: сначала найдите visitID через hits по URL, затем загрузите visits по visitID.")
 
-    def _url_filter_variants(self, url_filter: str) -> list[tuple[str, str]]:
+    def _url_filter_variants(self, url_filter: str, experimental_substring: bool = False) -> list[tuple[str, str]]:
         raw = str(url_filter).strip()
-        escaped = self._escape(raw)
-        variants = [("contains", f"ym:pv:URL=@'{escaped}'"), ("regexp", f"ym:pv:URL=~'.*{escaped}.*'")]
-        if raw.startswith("/"):
-            for host in ("https://www.bitrix24.ru", "https://bitrix24.ru"):
-                full_url = self._escape(host + raw)
-                variants.extend([
-                    (f"exact {host}", f"ym:pv:URL=='{full_url}'"),
-                    (f"contains {host}", f"ym:pv:URL=@'{full_url}'"),
-                ])
+        if not raw:
+            return []
+
+        exact_urls: list[str]
+        if raw.lower().startswith("http"):
+            exact_urls = [raw]
+        elif raw.startswith("/"):
+            exact_urls = [f"https://www.bitrix24.ru{raw}", f"https://bitrix24.ru{raw}"]
+        else:
+            exact_urls = [raw]
+
+        variants = [(f"exact {url}", f"ym:pv:URL=='{self._escape(url)}'") for url in exact_urls]
+        if experimental_substring:
+            escaped = self._escape(raw)
+            variants.extend([("contains", f"ym:pv:URL=@'{escaped}'"), ("regexp", f"ym:pv:URL=~'.*{escaped}.*'")])
         return variants
 
-    def fetch_hits_for_url(self, counter_id, date_from, date_to, url_filter: str) -> pd.DataFrame:
+    def fetch_hits_for_url(self, counter_id, date_from, date_to, url_filter: str, experimental_substring: bool = False) -> pd.DataFrame:
         if not str(url_filter).strip():
             raise MetrikaAPIError("URL-фильтр обязателен. Нельзя загружать весь счетчик без URL-фильтра.")
         errors = []
-        for label, filters in self._url_filter_variants(url_filter):
+        for label, filters in self._url_filter_variants(url_filter, experimental_substring=experimental_substring):
             try:
                 data = normalize_metrika_columns(self._fetch(counter_id, "hits", self._minimal_hit_fields(), date_from, date_to, filters))
                 if not data.empty:
                     data["server_filter_mode"] = label
+                    data["server_filter"] = filters
                     return data
             except MetrikaAPIError as exc:
                 text = str(exc)
                 errors.append(text)
                 if "Запрос слишком широкий" in text:
-                    continue
+                    raise
                 if "Синтаксис фильтра не принят" in text:
                     continue
                 raise
-        if any("Запрос слишком широкий" in err for err in errors):
-            raise MetrikaAPIError(
-                "Серверный URL-фильтр не сработал, Logs API пытается выгрузить слишком много данных. "
-                "Попробуйте полный URL или более узкий период."
-            )
-        raise MetrikaAPIError("По URL ничего не найдено. Проверьте дату, URL и счетчик.")
+        raise MetrikaAPIError(
+            "По точному URL просмотров не найдено. Возможно, реальные URL содержат UTM/параметры. "
+            "Для безопасной проверки попробуйте другой точный URL из Метрики или включите экспериментальный режим на очень маленьком периоде."
+        )
 
     def fetch_visits_for_visit_ids(self, counter_id, date_from, date_to, visit_ids: Iterable, batch_size: int = 100) -> pd.DataFrame:
         ids = [str(v) for v in visit_ids if str(v).strip()]
