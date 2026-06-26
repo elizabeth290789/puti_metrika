@@ -49,10 +49,11 @@ def mark_target_reached(visits_df: pd.DataFrame, selected_goal_ids: Iterable) ->
     """Add target_reached flag based on selected goal IDs."""
     result = visits_df.copy()
     target_ids = _coerce_goal_set(selected_goal_ids)
-    if "goalsID" not in result.columns:
+    goals_col = "goalsID" if "goalsID" in result.columns else "ym:s:goalsID" if "ym:s:goalsID" in result.columns else None
+    if goals_col is None:
         result["target_reached"] = False
         return result
-    result["target_reached"] = result["goalsID"].apply(lambda value: bool(parse_goal_ids(value) & target_ids))
+    result["target_reached"] = result[goals_col].apply(lambda value: bool(parse_goal_ids(value) & target_ids))
     return result
 
 

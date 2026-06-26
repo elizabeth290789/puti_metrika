@@ -26,6 +26,9 @@ class MetrikaAPIError(Exception):
     """User-safe Metrika API error without token details."""
 
 
+LOGS_API_CONNECTION_ERROR = "Соединение с Logs API оборвалось. Уменьшите период, URL-фильтр или лимит visitID."
+
+
 def get_metrika_token() -> str | None:
     """Read token from env first, then from Streamlit secrets."""
     token = os.getenv("YANDEX_METRIKA_TOKEN")
@@ -98,7 +101,10 @@ class MetrikaLogsClient:
         self._require_token()
         params = {"date1": str(date_from), "date2": str(date_to), "source": source, "fields": ",".join(fields), "filters": filters}
         url = self._create_request_url(counter_id)
-        response = self.session.post(url, params=params, timeout=60)
+        try:
+            response = self.session.post(url, params=params, timeout=60)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.RequestException) as exc:
+            raise MetrikaAPIError(LOGS_API_CONNECTION_ERROR) from exc
         data = self._handle_json_response(response, "создание запроса", url)
         return int(data["log_request"]["request_id"])
 
@@ -106,7 +112,10 @@ class MetrikaLogsClient:
         deadline = time.time() + self.timeout_seconds
         url = self._request_url(counter_id, request_id)
         while time.time() < deadline:
-            response = self.session.get(url, timeout=60)
+            try:
+                response = self.session.get(url, timeout=60)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.RequestException) as exc:
+                raise MetrikaAPIError(LOGS_API_CONNECTION_ERROR) from exc
             data = self._handle_json_response(response, "проверка статуса", url)
             request = data.get("log_request", {})
             status = request.get("status")
@@ -123,7 +132,10 @@ class MetrikaLogsClient:
         for part in parts:
             part_number = part.get("part_number")
             url = f"{self._request_url(counter_id, request_id)}/part/{part_number}/download"
-            response = self.session.get(url, timeout=120)
+            try:
+                response = self.session.get(url, timeout=120)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.RequestException) as exc:
+                raise MetrikaAPIError(LOGS_API_CONNECTION_ERROR) from exc
             text = self._handle_text_response(response, "скачивание данных", url)
             if not text.strip():
                 continue
@@ -164,17 +176,24 @@ class MetrikaLogsClient:
         fields = ["ym:pv:visitID", "ym:pv:dateTime", "ym:pv:URL", "ym:pv:title", "ym:pv:referer", "ym:pv:goalsID"]
         return self._fetch(counter_id, "hits", fields, date_from, date_to, f"ym:pv:URL=='{self._escape(url_filter)}'")
 
-    def fetch_hits_for_visit_ids(self, counter_id, date_from, date_to, visit_ids: Iterable, batch_size: int = 100) -> pd.DataFrame:
+    def fetch_hits_for_visit_ids(self, counter_id, date_from, date_to, visit_ids: Iterable, batch_size: int = 100, max_elapsed_seconds: int | None = None) -> pd.DataFrame:
         ids = [str(v) for v in visit_ids if str(v).strip()]
         if not ids:
             return pd.DataFrame()
         fields = ["ym:pv:visitID", "ym:pv:dateTime", "ym:pv:URL", "ym:pv:title", "ym:pv:referer", "ym:pv:goalsID"]
         frames = []
+        started_at = time.monotonic()
         try:
             for idx in range(0, len(ids), batch_size):
+                if max_elapsed_seconds is not None and time.monotonic() - started_at > max_elapsed_seconds:
+                    raise MetrikaAPIError("Загрузка hits заняла слишком много времени. Уменьшите лимит visitID.")
                 batch = ids[idx : idx + batch_size]
                 filters = "ym:pv:visitID IN (" + ",".join(batch) + ")"
                 frames.append(self._fetch(counter_id, "hits", fields, date_from, date_to, filters))
         except MetrikaAPIError as exc:
+            if str(exc) in {LOGS_API_CONNECTION_ERROR, "Загрузка hits заняла слишком много времени. Уменьшите лимит visitID."}:
+                raise
+            if "Превышено время ожидания обработки запроса Logs API" in str(exc):
+                raise MetrikaAPIError("Загрузка hits заняла слишком много времени. Уменьшите лимит visitID.") from exc
             raise MetrikaAPIError("Не удалось загрузить hits по visitID. Нельзя построить полный путь. Проверьте синтаксис фильтра Logs API или используйте более узкую дату/URL.") from exc
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
