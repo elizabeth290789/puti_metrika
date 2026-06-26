@@ -207,10 +207,15 @@ with st.sidebar:
     date_from = st.date_input("date_from", value=yesterday, max_value=yesterday)
     date_to = st.date_input("date_to", value=yesterday, max_value=yesterday)
     selected_url = st.text_input(
-        "URL содержит",
-        value="/promo/b24messenger/team/",
-        help="Можно вводить часть адреса, например /promo/free-online-crm/. Сначала приложение безопасно ищет hits с этим URL и только потом грузит visits по найденным visitID.",
+        "Точный URL страницы",
+        value="https://www.bitrix24.ru/promo/b24messenger/team/",
+        help=(
+            "Для первой версии укажите полный URL без UTM-параметров, например "
+            "https://www.bitrix24.ru/promo/free-online-crm/. Отчет v0.1 работает только по точному "
+            "совпадению URL, чтобы не выгружать весь счетчик."
+        ),
     )
+    experimental_substring = st.checkbox("Экспериментально: искать URL как подстроку", value=False)
     goal_ids_raw = st.text_input("ID цели", value="2898778")
     max_steps = st.number_input("Максимум шагов пути", min_value=1, max_value=10, value=3, step=1)
     visit_id_limit = st.selectbox("Максимум visitID для загрузки visits/hits", VISIT_ID_LIMIT_OPTIONS, index=2)
@@ -251,16 +256,24 @@ if load_report:
     selected_goal_ids = parse_goal_ids(goal_ids_raw)
     try:
         client = MetrikaLogsClient(token=token, timeout_seconds=HITS_TIMEOUT_SECONDS)
+        if experimental_substring:
+            st.warning("Этот режим может создать слишком большой запрос в Logs API.")
         with st.spinner("Шаг 1/3: безопасно ищем hits по выбранному URL..."):
-            matching_hits = client.fetch_hits_for_url(counter_id, date_from, date_to, selected_url)
+            matching_hits = client.fetch_hits_for_url(counter_id, date_from, date_to, selected_url, experimental_substring=experimental_substring)
         matching_hits = normalize_metrika_columns(matching_hits)
         if matching_hits.empty or "visitID" not in matching_hits.columns:
-            st.info("По URL ничего не найдено. Попробуйте полный URL или проверьте дату.")
+            st.info("По точному URL просмотров не найдено. Возможно, реальные URL содержат UTM/параметры. Для безопасной проверки попробуйте другой точный URL из Метрики или включите экспериментальный режим на очень маленьком периоде.")
             st.stop()
 
         matching_visit_ids = matching_hits["visitID"].dropna().drop_duplicates().tolist()
         total_found = len(matching_visit_ids)
+        used_filter = str(matching_hits.get("server_filter", pd.Series(["—"])).iloc[0])
         st.success(f"Найдено visitID с выбранным URL: {total_found}")
+        st.write(f"Использованный фильтр: `{used_filter}`")
+        st.write(f"Hits найдено: {len(matching_hits)}")
+        st.write(f"Уникальных visitID найдено: {total_found}")
+        st.write("Первые 10 найденных URL")
+        st.dataframe(matching_hits[["URL"]].head(10), use_container_width=True, hide_index=True)
         selected_visit_ids = _limited_visit_ids_from_hits(matching_hits, int(visit_id_limit))
         if total_found > len(selected_visit_ids):
             st.warning(f"Найдено {total_found} visitID. По лимиту сайдбара загружаем только первые {len(selected_visit_ids)}.")
@@ -303,11 +316,13 @@ if load_report:
             "visit_id_limit": int(visit_id_limit),
             "total_found": total_found,
             "server_filter_mode": str(matching_hits.get("server_filter_mode", pd.Series(["—"])).iloc[0]) if not matching_hits.empty else "—",
+            "server_filter": str(matching_hits.get("server_filter", pd.Series(["—"])).iloc[0]) if not matching_hits.empty else "—",
+            "matching_hits_count": len(matching_hits),
         }
     except MetrikaAPIError as exc:
         st.error(str(exc))
         if "слишком" in str(exc).lower() or "too big" in str(exc).lower():
-            st.info("Серверный URL-фильтр не сработал, Logs API пытается выгрузить слишком много данных. Попробуйте полный URL или более узкий период.")
+            st.info("Серверный URL-фильтр не сработал, Logs API пытается выгрузить слишком много данных. Остановлено без fallback на широкий запрос.")
     except Exception as exc:
         st.exception(exc)
 
@@ -325,14 +340,17 @@ if not visits.empty:
     st.subheader("2. Найденные visitID и ограниченная выгрузка")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Найдено visitID с URL", params.get("total_found", 0))
-    c2.metric("Загружено visits", len(visits))
-    c3.metric("Лимит visitID", params.get("visit_id_limit", visit_id_limit))
-    c4.metric("Режим URL-фильтра", params.get("server_filter_mode", "—"))
+    c2.metric("Hits найдено", params.get("matching_hits_count", len(matching_hits)))
+    c3.metric("Загружено visits", len(visits))
+    c4.metric("Лимит visitID", params.get("visit_id_limit", visit_id_limit))
+    st.write(f"Использованный фильтр: `{params.get('server_filter', '—')}`")
     st.caption("Отчет начинается с маленькой выгрузки hits по URL. Visits и full hits загружаются только по найденным visitID через IN (...), без fallback на выгрузку всего счетчика.")
     _show_goal_debug(visits, active_goal_ids)
 
     if not matching_hits.empty:
         with st.expander("Hits, по которым найдены visitID", expanded=False):
+            st.write("Первые 10 найденных URL")
+            st.dataframe(matching_hits[["URL"]].head(10), use_container_width=True, hide_index=True)
             st.dataframe(matching_hits.head(100), use_container_width=True)
 
     if not paths.empty:
